@@ -20,6 +20,7 @@ enum CurrMode<'a> {
     Let(&'a str),
     LetStar(&'a str),
     All,
+    AllStar,
     Num,
     LoadStd,
 }
@@ -55,6 +56,7 @@ impl fmt::Display for Error<'_> {
     }
 }
 
+const REDUCTION_LIMIT: usize = 4096;
 const STDLIB: &[(&str, &str)] = &[
     ("id", "λx.x"),
     ("const", "λx.λy.x"),
@@ -83,7 +85,26 @@ const STDLIB: &[(&str, &str)] = &[
     ("two", "succ one"),
     ("three", "succ two"),
     ("four", "succ three"),
+    ("five", "succ four"),
+    ("six", "succ five"),
+    ("seven", "succ six"),
+    ("eight", "succ seven"),
+    ("nine", "succ eight"),
+    ("ten", "succ nine"),
+    // Conditionals
+    ("isZero", "λn.n (const false) true"),
+    ("le", "λm.λn.isZero (sub m n)"),
+    ("eq", "λm.λn.and (le m n) (le n m)"),
+    ("ne", "λm.λn.not (eq m n)"),
+    ("gt", "λm.λn.not (le m n)"),
+    ("ge", "λm.λn.or (gt m n) (eq m n)"),
+    ("lt", "λm.λn.and (le m n) (not (eq m n))"),
+];
+
+const STDLIB_REC: &[(&str, &str)] = &[
+    // Y-combinator
     ("Y", "(λx.x x) (λx.x x)"),
+    ("fix", "λf.(λx.f (x x)) (λx.f (x x))"),
 ];
 
 fn help_msg() -> String {
@@ -91,7 +112,7 @@ fn help_msg() -> String {
         "Use `:help <command>` or `:h <command>` for details about each command\nList of commands:"
             .to_string();
     for c in [
-        "all", "env", "h", "help", "let", "let*", "loadstd", "num", "quit", "q",
+        "all", "all*", "env", "h", "help", "let", "let*", "loadstd", "num", "quit", "q",
     ] {
         help_msg.push_str("\n - ");
         help_msg.push_str(c);
@@ -112,20 +133,24 @@ fn replace_from_env(expr: Expr, env: &Env) -> Expr {
     expr
 }
 
-fn reduce_apps(expr: Expr, num: usize) -> usize {
+fn reduce_apps_to_num(func_var: VarName, var: VarName, expr: Expr, num: usize) -> Option<usize> {
     match expr {
-        Expr::App(f, body) if matches!(*f, Expr::Var(_)) => reduce_apps(*body, num + 1),
-        _ => num,
+        Expr::App(f, body) => match *f {
+            Expr::Var(f) if f == func_var => reduce_apps_to_num(func_var, var, *body, num + 1),
+            _ => None,
+        },
+        Expr::Var(x) if x == var => Some(num),
+        _ => None,
     }
 }
 
-fn app_to_num(expr: Expr) -> usize {
+fn app_to_num(expr: Expr) -> Option<usize> {
     match expr {
-        Expr::Abs(_, body) => match *body {
-            Expr::Abs(_, body) => reduce_apps(*body, 0),
-            _ => 0,
+        Expr::Abs(f, body) => match *body {
+            Expr::Abs(x, body) => reduce_apps_to_num(f, x, *body, 0),
+            _ => None,
         },
-        _ => 0,
+        _ => None,
     }
 }
 
@@ -135,7 +160,7 @@ where
 {
     let mut var_id = 0usize;
     let mut curr = expr.bind_vars(&mut var_id);
-    for _ in 0..2000 {
+    for _ in 0..REDUCTION_LIMIT {
         let mut next = curr.clone().reduce(&mut var_id);
         if next == curr {
             // Try to find if we can reduce further by updating variable IDs
@@ -185,6 +210,11 @@ fn process_line<'b, 'a>(input: &'a str, env: &'b mut Env) -> Result<(), Error<'a
                         ":all <expr>\nReduce expression as much as possible and print each reduction"
                     );
                 }
+                "all*" => {
+                    println!(
+                        ":all* <expr>\nReduce expression as much as possible and print only reduced form"
+                    );
+                }
                 "env" => {
                     println!(
                         ":env <binding?>\nPrint current environment. If binding name is provided, print only it"
@@ -215,6 +245,7 @@ fn process_line<'b, 'a>(input: &'a str, env: &'b mut Env) -> Result<(), Error<'a
             return Ok(());
         }
         (":all", rest) => (CurrMode::All, rest.trim()),
+        (":all*", rest) => (CurrMode::AllStar, rest.trim()),
         (":num", rest) => (CurrMode::Num, rest.trim()),
         (":loadstd", rest) => (CurrMode::LoadStd, rest),
         (command, rest) if command == ":let" || command == ":let*" => {
@@ -238,6 +269,12 @@ fn process_line<'b, 'a>(input: &'a str, env: &'b mut Env) -> Result<(), Error<'a
                 .parse_expr()
                 .map_err(|err| Error::ParserError(err))?;
             let (expr, _) = eval_loop(replace_from_env(parsed, env), |_| true);
+            env.insert(key.to_string(), expr.free_variables());
+        }
+        for (key, value) in STDLIB_REC {
+            let expr = Lexer::new(value)
+                .parse_expr()
+                .map_err(|err| Error::ParserError(err))?;
             env.insert(key.to_string(), expr.free_variables());
         }
         return Ok(());
@@ -265,8 +302,7 @@ fn process_line<'b, 'a>(input: &'a str, env: &'b mut Env) -> Result<(), Error<'a
             if exceeded_limit {
                 return Err(Error::ExceedLimit);
             }
-            let num = app_to_num(expr);
-            println!("{num}");
+            app_to_num(expr).map_or_else(|| println!("NaN"), |num| println!("{num}"));
             Ok(())
         }
         CurrMode::All => {
@@ -279,6 +315,14 @@ fn process_line<'b, 'a>(input: &'a str, env: &'b mut Env) -> Result<(), Error<'a
             } else {
                 println!("{expr}");
             }
+            Ok(())
+        }
+        CurrMode::AllStar => {
+            let (expr, exceed_limit) = eval_loop(expr, |_| true);
+            if exceed_limit {
+                println!("Couldn't reduce it fully, the result of {REDUCTION_LIMIT} reductions:")
+            }
+            println!("{expr}", expr = expr.free_variables());
             Ok(())
         }
         CurrMode::Default => {
